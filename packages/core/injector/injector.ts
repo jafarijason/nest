@@ -1,3 +1,4 @@
+import { Logger, LoggerService } from '@nestjs/common';
 import {
   OPTIONAL_DEPS_METADATA,
   OPTIONAL_PROPERTY_DEPS_METADATA,
@@ -8,6 +9,7 @@ import {
 import { Controller } from '@nestjs/common/interfaces/controllers/controller.interface';
 import { Injectable } from '@nestjs/common/interfaces/injectable.interface';
 import { Type } from '@nestjs/common/interfaces/type.interface';
+import { clc } from '@nestjs/common/utils/cli-colors.util';
 import {
   isFunction,
   isNil,
@@ -27,7 +29,7 @@ import {
   InstanceWrapper,
   PropertyMetadata,
 } from './instance-wrapper';
-import { Module } from './module';
+import { InstanceToken, Module } from './module';
 
 /**
  * The type of an injectable dependency
@@ -54,9 +56,9 @@ export interface InjectorDependencyContext {
    */
   key?: string | symbol;
   /**
-   * The name of the function or injection token
+   * The function itself, the name of the function, or injection token.
    */
-  name?: string | symbol;
+  name?: Function | string | symbol;
   /**
    * The index of the dependency which gets injected
    * from the dependencies array
@@ -69,28 +71,30 @@ export interface InjectorDependencyContext {
 }
 
 export class Injector {
+  private logger: LoggerService = new Logger('InjectorLogger');
+
   public loadPrototype<T>(
-    { name }: InstanceWrapper<T>,
-    collection: Map<string, InstanceWrapper<T>>,
+    { token }: InstanceWrapper<T>,
+    collection: Map<InstanceToken, InstanceWrapper<T>>,
     contextId = STATIC_CONTEXT,
   ) {
     if (!collection) {
       return;
     }
-    const target = collection.get(name);
+    const target = collection.get(token);
     const instance = target.createPrototype(contextId);
     if (instance) {
       const wrapper = new InstanceWrapper({
         ...target,
         instance,
       });
-      collection.set(name, wrapper);
+      collection.set(token, wrapper);
     }
   }
 
   public async loadInstance<T>(
     wrapper: InstanceWrapper<T>,
-    collection: Map<string, InstanceWrapper>,
+    collection: Map<InstanceToken, InstanceWrapper>,
     moduleRef: Module,
     contextId = STATIC_CONTEXT,
     inquirer?: InstanceWrapper,
@@ -101,9 +105,10 @@ export class Injector {
       return instanceHost.donePromise;
     }
     const done = this.applyDoneHook(instanceHost);
-    const { name, inject } = wrapper;
+    const token = wrapper.token || wrapper.name;
 
-    const targetWrapper = collection.get(name);
+    const { inject } = wrapper;
+    const targetWrapper = collection.get(token);
     if (isUndefined(targetWrapper)) {
       throw new RuntimeException();
     }
@@ -142,13 +147,13 @@ export class Injector {
 
   public async loadMiddleware(
     wrapper: InstanceWrapper,
-    collection: Map<string, InstanceWrapper>,
+    collection: Map<InstanceToken, InstanceWrapper>,
     moduleRef: Module,
     contextId = STATIC_CONTEXT,
     inquirer?: InstanceWrapper,
   ) {
-    const { metatype } = wrapper;
-    const targetWrapper = collection.get(metatype.name);
+    const { metatype, token } = wrapper;
+    const targetWrapper = collection.get(token);
     if (!isUndefined(targetWrapper.instance)) {
       return;
     }
@@ -229,8 +234,9 @@ export class Injector {
     inquirer?: InstanceWrapper,
     parentInquirer?: InstanceWrapper,
   ) {
-    const inquirerId = this.getInquirerId(inquirer);
+    let inquirerId = this.getInquirerId(inquirer);
     const metadata = wrapper.getCtorMetadata();
+
     if (metadata && contextId !== STATIC_CONTEXT) {
       const deps = await this.loadCtorMetadata(
         metadata,
@@ -252,6 +258,10 @@ export class Injector {
       try {
         if (this.isInquirer(param, parentInquirer)) {
           return parentInquirer && parentInquirer.instance;
+        }
+        if (inquirer?.isTransient && parentInquirer) {
+          inquirer = parentInquirer;
+          inquirerId = this.getInquirerId(parentInquirer);
         }
         const paramWrapper = await this.resolveSingleParam<T>(
           wrapper,
@@ -317,7 +327,7 @@ export class Injector {
     const token = this.resolveParamToken(wrapper, param);
     return this.resolveComponentInstance<T>(
       moduleRef,
-      isFunction(token) ? (token as Type<any>).name : token,
+      token,
       dependencyContext,
       wrapper,
       contextId,
@@ -339,18 +349,20 @@ export class Injector {
 
   public async resolveComponentInstance<T>(
     moduleRef: Module,
-    name: any,
+    token: InstanceToken,
     dependencyContext: InjectorDependencyContext,
     wrapper: InstanceWrapper<T>,
     contextId = STATIC_CONTEXT,
     inquirer?: InstanceWrapper,
     keyOrIndex?: string | number,
   ): Promise<InstanceWrapper> {
+    this.printResolvingDependenciesLog(token, inquirer);
+    this.printLookingForProviderLog(token, moduleRef);
     const providers = moduleRef.providers;
     const instanceWrapper = await this.lookupComponent(
       providers,
       moduleRef,
-      { ...dependencyContext, name },
+      { ...dependencyContext, name: token },
       wrapper,
       contextId,
       inquirer,
@@ -407,7 +419,7 @@ export class Injector {
   }
 
   public async lookupComponent<T = any>(
-    providers: Map<string | symbol, InstanceWrapper>,
+    providers: Map<Function | string | symbol, InstanceWrapper>,
     moduleRef: Module,
     dependencyContext: InjectorDependencyContext,
     wrapper: InstanceWrapper<T>,
@@ -425,6 +437,7 @@ export class Injector {
     }
     if (providers.has(name)) {
       const instanceWrapper = providers.get(name);
+      this.printFoundInModuleLog(name, moduleRef);
       this.addDependencyMetadata(keyOrIndex, wrapper, instanceWrapper);
       return instanceWrapper;
     }
@@ -467,7 +480,7 @@ export class Injector {
 
   public async lookupComponentInImports(
     moduleRef: Module,
-    name: any,
+    name: InstanceToken,
     wrapper: InstanceWrapper,
     moduleRegistry: any[] = [],
     contextId = STATIC_CONTEXT,
@@ -476,7 +489,6 @@ export class Injector {
     isTraversing?: boolean,
   ): Promise<any> {
     let instanceWrapperRef: InstanceWrapper = null;
-
     const imports = moduleRef.imports || new Set<Module>();
     const identity = (item: any) => item;
 
@@ -484,13 +496,14 @@ export class Injector {
     if (isTraversing) {
       const contextModuleExports = moduleRef.exports;
       children = children.filter(child =>
-        contextModuleExports.has(child.metatype && child.metatype.name),
+        contextModuleExports.has(child.metatype),
       );
     }
     for (const relatedModule of children) {
       if (moduleRegistry.includes(relatedModule.id)) {
         continue;
       }
+      this.printLookingForProviderLog(name, relatedModule);
       moduleRegistry.push(relatedModule.id);
       const { providers, exports } = relatedModule;
       if (!exports.has(name) || !providers.has(name)) {
@@ -510,6 +523,7 @@ export class Injector {
         }
         continue;
       }
+      this.printFoundInModuleLog(name, relatedModule);
       instanceWrapperRef = providers.get(name);
       this.addDependencyMetadata(keyOrIndex, wrapper, instanceWrapperRef);
 
@@ -552,7 +566,7 @@ export class Injector {
         try {
           const dependencyContext = {
             key: item.key,
-            name: item.name as string,
+            name: item.name as Function | string | symbol,
           };
           if (this.isInquirer(item.name, parentInquirer)) {
             return parentInquirer && parentInquirer.instance;
@@ -644,7 +658,7 @@ export class Injector {
           )
         : new (metatype as Type<any>)(...instances);
     } else if (isInContext) {
-      const factoryReturnValue = ((targetMetatype.metatype as any) as Function)(
+      const factoryReturnValue = (targetMetatype.metatype as any as Function)(
         ...instances,
       );
       instanceHost.instance = await factoryReturnValue;
@@ -656,15 +670,12 @@ export class Injector {
   public async loadPerContext<T = any>(
     instance: T,
     moduleRef: Module,
-    collection: Map<string, InstanceWrapper>,
+    collection: Map<InstanceToken, InstanceWrapper>,
     ctx: ContextId,
     wrapper?: InstanceWrapper,
   ): Promise<T> {
     if (!wrapper) {
-      const providerCtor = instance.constructor;
-      const injectionToken =
-        (providerCtor && providerCtor.name) ||
-        ((providerCtor as unknown) as string);
+      const injectionToken = instance.constructor;
       wrapper = collection.get(injectionToken);
     }
     await this.loadInstance(wrapper, collection, moduleRef, ctx, wrapper);
@@ -776,5 +787,62 @@ export class Injector {
     isString(keyOrIndex)
       ? hostWrapper.addPropertiesMetadata(keyOrIndex, instanceWrapper)
       : hostWrapper.addCtorMetadata(keyOrIndex, instanceWrapper);
+  }
+
+  private getTokenName(token: InstanceToken): string {
+    return isFunction(token) ? (token as Function).name : token.toString();
+  }
+
+  private printResolvingDependenciesLog(
+    token: InstanceToken,
+    inquirer?: InstanceWrapper,
+  ): void {
+    if (!this.isDebugMode()) {
+      return;
+    }
+    const tokenName = this.getTokenName(token);
+    const dependentName = inquirer?.name ?? 'unknown';
+    const isAlias = dependentName === tokenName;
+
+    const messageToPrint = `Resolving dependency ${clc.cyanBright(
+      tokenName,
+    )}${clc.green(' in the ')}${clc.yellow(dependentName)}${clc.green(
+      ` provider ${isAlias ? '(alias)' : ''}`,
+    )}`;
+
+    this.logger.log(messageToPrint);
+  }
+
+  private printLookingForProviderLog(
+    token: InstanceToken,
+    moduleRef: Module,
+  ): void {
+    if (!this.isDebugMode()) {
+      return;
+    }
+    const tokenName = this.getTokenName(token);
+    const moduleRefName = moduleRef?.metatype?.name ?? 'unknown';
+    this.logger.log(
+      `Looking for ${clc.cyanBright(tokenName)}${clc.green(
+        ' in ',
+      )}${clc.magentaBright(moduleRefName)}`,
+    );
+  }
+
+  private printFoundInModuleLog(token: InstanceToken, moduleRef: Module): void {
+    if (!this.isDebugMode()) {
+      return;
+    }
+    const tokenName = this.getTokenName(token);
+    const moduleRefName = moduleRef?.metatype?.name ?? 'unknown';
+    this.logger.log(
+      `Found ${clc.cyanBright(tokenName)}${clc.green(
+        ' in ',
+      )}${clc.magentaBright(moduleRefName)}`,
+    );
+  }
+
+  private isDebugMode(): boolean {
+    return !!process.env.NEST_DEBUG;
   }
 }

@@ -39,6 +39,7 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
   protected client: Kafka = null;
   protected consumer: Consumer = null;
   protected producer: Producer = null;
+  protected parser: KafkaParser = null;
 
   protected brokers: string[] | BrokersFunction;
   protected clientId: string;
@@ -66,13 +67,21 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
       require('kafkajs'),
     );
 
+    this.parser = new KafkaParser((options && options.parser) || undefined);
+
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
 
-  public async listen(callback: () => void): Promise<void> {
-    this.client = this.createClient();
-    await this.start(callback);
+  public async listen(
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+  ): Promise<void> {
+    try {
+      this.client = this.createClient();
+      await this.start(callback);
+    } catch (err) {
+      callback(err);
+    }
   }
 
   public async close(): Promise<void> {
@@ -98,11 +107,11 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
 
   public createClient<T = any>(): T {
     return new kafkaPackage.Kafka(
-      Object.assign(this.options.client || {}, {
-        clientId: this.clientId,
-        brokers: this.brokers,
-        logCreator: KafkaLogger.bind(null, this.logger),
-      }) as KafkaConfig,
+      Object.assign(
+        { logCreator: KafkaLogger.bind(null, this.logger) },
+        this.options.client,
+        { clientId: this.clientId, brokers: this.brokers },
+      ) as KafkaConfig,
     );
   }
 
@@ -137,18 +146,18 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
 
   public async handleMessage(payload: EachMessagePayload) {
     const channel = payload.topic;
-    const rawMessage = KafkaParser.parse<KafkaMessage>(
+    const rawMessage = this.parser.parse<KafkaMessage>(
       Object.assign(payload.message, {
         topic: payload.topic,
         partition: payload.partition,
       }),
     );
-    const headers = (rawMessage.headers as unknown) as Record<string, any>;
+    const headers = rawMessage.headers as unknown as Record<string, any>;
     const correlationId = headers[KafkaHeaders.CORRELATION_ID];
     const replyTopic = headers[KafkaHeaders.REPLY_TOPIC];
     const replyPartition = headers[KafkaHeaders.REPLY_PARTITION];
 
-    const packet = this.deserializer.deserialize(rawMessage, { channel });
+    const packet = await this.deserializer.deserialize(rawMessage, { channel });
     const kafkaContext = new KafkaContext([
       rawMessage,
       payload.partition,
@@ -227,9 +236,8 @@ export class ServerKafka extends Server implements CustomTransportStrategy {
     correlationId: string,
     outgoingMessage: Message,
   ) {
-    outgoingMessage.headers[KafkaHeaders.CORRELATION_ID] = Buffer.from(
-      correlationId,
-    );
+    outgoingMessage.headers[KafkaHeaders.CORRELATION_ID] =
+      Buffer.from(correlationId);
   }
 
   public assignReplyPartition(

@@ -40,10 +40,11 @@ import { ClientProxy } from './client-proxy';
 let kafkaPackage: any = {};
 
 export class ClientKafka extends ClientProxy {
+  protected logger = new Logger(ClientKafka.name);
   protected client: Kafka = null;
   protected consumer: Consumer = null;
   protected producer: Producer = null;
-  protected logger = new Logger(ClientKafka.name);
+  protected parser: KafkaParser = null;
   protected responsePatterns: string[] = [];
   protected consumerAssignments: { [key: string]: number } = {};
 
@@ -72,6 +73,8 @@ export class ClientKafka extends ClientProxy {
     kafkaPackage = loadPackage('kafkajs', ClientKafka.name, () =>
       require('kafkajs'),
     );
+
+    this.parser = new KafkaParser((options && options.parser) || undefined);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
@@ -142,18 +145,18 @@ export class ClientKafka extends ClientProxy {
   }
 
   public createClient<T = any>(): T {
-    return new kafkaPackage.Kafka(
-      Object.assign(this.options.client || {}, {
-        clientId: this.clientId,
-        brokers: this.brokers,
-        logCreator: KafkaLogger.bind(null, this.logger),
-      }) as KafkaConfig,
+    const kafkaConfig: KafkaConfig = Object.assign(
+      { logCreator: KafkaLogger.bind(null, this.logger) },
+      this.options.client,
+      { brokers: this.brokers, clientId: this.clientId },
     );
+
+    return new kafkaPackage.Kafka(kafkaConfig);
   }
 
   public createResponseCallback(): (payload: EachMessagePayload) => any {
-    return (payload: EachMessagePayload) => {
-      const rawMessage = KafkaParser.parse<KafkaMessage>(
+    return async (payload: EachMessagePayload) => {
+      const rawMessage = this.parser.parse<KafkaMessage>(
         Object.assign(payload.message, {
           topic: payload.topic,
           partition: payload.partition,
@@ -162,9 +165,8 @@ export class ClientKafka extends ClientProxy {
       if (isUndefined(rawMessage.headers[KafkaHeaders.CORRELATION_ID])) {
         return;
       }
-      const { err, response, isDisposed, id } = this.deserializer.deserialize(
-        rawMessage,
-      );
+      const { err, response, isDisposed, id } =
+        await this.deserializer.deserialize(rawMessage);
       const callback = this.routingMap.get(id);
       if (!callback) {
         return;
@@ -213,7 +215,7 @@ export class ClientKafka extends ClientProxy {
   protected publish(
     partialPacket: ReadPacket,
     callback: (packet: WritePacket) => any,
-  ): Function {
+  ): () => void {
     try {
       const packet = this.assignPacketId(partialPacket);
       const pattern = this.normalizePattern(partialPacket.pattern);
